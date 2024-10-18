@@ -40,6 +40,7 @@ const (
 	podContainerPortNameLabel     = metaLabelPrefix + "pod_container_port_name"
 	podContainerPortNumberLabel   = metaLabelPrefix + "pod_container_port_number"
 	podContainerPortProtocolLabel = metaLabelPrefix + "pod_container_port_protocol"
+	podContainerIsEphemeral       = metaLabelPrefix + "pod_container_ephemeral"
 	podContainerIsInit            = metaLabelPrefix + "pod_container_init"
 	podReadyLabel                 = metaLabelPrefix + "pod_ready"
 	podPhaseLabel                 = metaLabelPrefix + "pod_phase"
@@ -195,59 +196,99 @@ func (d *Discovery) refresh(podList v1.PodList) ([]*targetgroup.Group, error) {
 }
 
 func (d *Discovery) buildPodTargetGroup(pod v1.Pod) *targetgroup.Group {
-	tg := &targetgroup.Group{
-		Source: podSource(pod),
-	}
-	// PodIP can be empty when a pod is starting or has been evicted.
-	if len(pod.Status.PodIP) == 0 {
-		return tg
-	}
+    tg := &targetgroup.Group{
+        Source: podSource(pod),
+    }
+    // PodIP can be empty when a pod is starting or has been evicted.
+    if len(pod.Status.PodIP) == 0 {
+        return tg
+    }
 
-	tg.Labels = podLabels(pod)
-	tg.Labels[namespaceLabel] = lv(pod.Namespace)
+    tg.Labels = podLabels(pod)
+    tg.Labels[namespaceLabel] = lv(pod.Namespace)
 
-	containers := append(pod.Spec.Containers, pod.Spec.InitContainers...)
-	for i, c := range containers {
-		isInit := i >= len(pod.Spec.Containers)
-		cStatuses := &pod.Status.ContainerStatuses
-		if isInit {
-			cStatuses = &pod.Status.InitContainerStatuses
-		}
-		cID := d.findPodContainerID(cStatuses, c.Name)
+    // Define a common struct to hold container information.
+    type containerInfo struct {
+        name        string
+        image       string
+        ports       []v1.ContainerPort
+        isInit      bool
+        isEphemeral bool
+        statuses    *[]v1.ContainerStatus
+    }
 
-		// If no ports are defined for the container, create an anonymous
-		// target per container.
-		if len(c.Ports) == 0 {
-			// We don't have a port so we just set the address label to the pod IP.
-			// The user has to add a port manually.
-			tg.Targets = append(tg.Targets, model.LabelSet{
-				model.AddressLabel:     lv(pod.Status.PodIP),
-				podContainerNameLabel:  lv(c.Name),
-				podContainerIDLabel:    lv(cID),
-				podContainerImageLabel: lv(c.Image),
-				podContainerIsInit:     lv(strconv.FormatBool(isInit)),
-			})
-			continue
-		}
+    // Collect all containers into a single slice.
+    var containers []containerInfo
 
-		for _, port := range c.Ports {
-			ports := strconv.FormatUint(uint64(port.ContainerPort), 10)
-			addr := net.JoinHostPort(pod.Status.PodIP, ports)
+    for _, c := range pod.Spec.Containers {
+        containers = append(containers, containerInfo{
+            name:        c.Name,
+            image:       c.Image,
+            ports:       c.Ports,
+            isInit:      false,
+            isEphemeral: false,
+            statuses:    &pod.Status.ContainerStatuses,
+        })
+    }
 
-			tg.Targets = append(tg.Targets, model.LabelSet{
-				model.AddressLabel:            lv(addr),
-				podContainerNameLabel:         lv(c.Name),
-				podContainerIDLabel:           lv(cID),
-				podContainerImageLabel:        lv(c.Image),
-				podContainerPortNumberLabel:   lv(ports),
-				podContainerPortNameLabel:     lv(port.Name),
-				podContainerPortProtocolLabel: lv(string(port.Protocol)),
-				podContainerIsInit:            lv(strconv.FormatBool(isInit)),
-			})
-		}
-	}
+    for _, c := range pod.Spec.InitContainers {
+        containers = append(containers, containerInfo{
+            name:        c.Name,
+            image:       c.Image,
+            ports:       c.Ports,
+            isInit:      true,
+            isEphemeral: false,
+            statuses:    &pod.Status.InitContainerStatuses,
+        })
+    }
 
-	return tg
+    for _, ec := range pod.Spec.EphemeralContainers {
+        containers = append(containers, containerInfo{
+            name:        ec.Name,
+            image:       ec.Image,
+            ports:       ec.Ports,
+            isInit:      false,
+            isEphemeral: true,
+            statuses:    &pod.Status.EphemeralContainerStatuses,
+        })
+    }
+
+    for _, ci := range containers {
+        cID := d.findPodContainerID(ci.statuses, ci.name)
+
+        // If no ports are defined for the container, create an anonymous target.
+        if len(ci.ports) == 0 {
+            tg.Targets = append(tg.Targets, model.LabelSet{
+                model.AddressLabel:           lv(pod.Status.PodIP),
+                podContainerNameLabel:        lv(ci.name),
+                podContainerIDLabel:          lv(cID),
+                podContainerImageLabel:       lv(ci.image),
+                podContainerIsInit:           lv(strconv.FormatBool(ci.isInit)),
+                podContainerIsEphemeral:      lv(strconv.FormatBool(ci.isEphemeral)),
+            })
+            continue
+        }
+
+        // Process each port defined for the container.
+        for _, port := range ci.ports {
+            ports := strconv.FormatUint(uint64(port.ContainerPort), 10)
+            addr := net.JoinHostPort(pod.Status.PodIP, ports)
+
+            tg.Targets = append(tg.Targets, model.LabelSet{
+                model.AddressLabel:            lv(addr),
+                podContainerNameLabel:         lv(ci.name),
+                podContainerIDLabel:           lv(cID),
+                podContainerImageLabel:        lv(ci.image),
+                podContainerPortNumberLabel:   lv(ports),
+                podContainerPortNameLabel:     lv(port.Name),
+                podContainerPortProtocolLabel: lv(string(port.Protocol)),
+                podContainerIsInit:            lv(strconv.FormatBool(ci.isInit)),
+                podContainerIsEphemeral:       lv(strconv.FormatBool(ci.isEphemeral)),
+            })
+        }
+    }
+
+    return tg
 }
 
 func (p *Discovery) findPodContainerStatus(statuses *[]v1.ContainerStatus, containerName string) (*v1.ContainerStatus, error) {
